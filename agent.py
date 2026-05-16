@@ -367,8 +367,8 @@ def build_catalog_context(retrieved: list[dict]) -> str:
         languages = ", ".join(item.get("languages") or []) or "—"
         duration = item.get("duration") or "—"
         description = (item.get("description") or "").strip()
-        if len(description) > 300:
-            description = description[:300].rstrip() + "..."
+        if len(description) > 200:
+            description = description[:200].rstrip() + "..."
         lines.append(
             f"[{i}] {item.get('name', meta['name'])}\n"
             f"    URL: {url}\n"
@@ -597,11 +597,15 @@ def run_agent_turn(messages: list[dict]) -> dict:
     conversation_text = "\n".join(
         (m.get("content") or "") for m in messages if m.get("role") == "user"
     )
+    # 22 candidates with shorter per-item context = ~half the prompt tokens
+    # of a 30-candidate pool, which keeps p50 latency comfortably under our
+    # 27 s internal timeout. The seeds + multi-aspect coverage still ensure
+    # the right items reach the top of the pool.
     retrieved = build_candidate_pool(
         primary_query=intent_query,
         conversation_text=conversation_text,
-        per_query=12,
-        cap=30,
+        per_query=8,
+        cap=22,
     )
 
     # Step 3: build prompt. Use replace() rather than .format() so any literal

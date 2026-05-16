@@ -306,7 +306,7 @@ def looks_like_shortlist_offered(resp: dict) -> bool:
     return len(resp.get("recommendations", [])) >= 1
 
 
-def call_chat(messages, timeout=60, retries=3):
+def call_chat(messages, timeout=45, retries=2):
     last_exc = None
     for attempt in range(retries):
         t0 = time.time()
@@ -337,6 +337,7 @@ def run_trace(trace: dict, verbose: bool = True) -> dict:
     final_recs: list[dict] = []
     end_signaled_by_agent = False
     turn_index = 0
+    consecutive_empty_replies = 0  # to detect a stuck/timeout-looping agent
 
     if verbose:
         print(f"\n── {trace['id']}: {trace['persona']} ──")
@@ -355,6 +356,23 @@ def run_trace(trace: dict, verbose: bool = True) -> dict:
 
         problems = validate_schema(resp, where=f"{trace['id']}.t{turn_index}")
         schema_problems.extend(problems)
+
+        # Detect a stuck agent (consecutive empty/timeout replies). The SHL
+        # evaluator's simulated user only has so much patience; if we get
+        # two timeout-style empty responses in a row, end the trace rather
+        # than burning the rest of the 8-turn budget.
+        is_timeout_reply = (
+            len(resp.get("recommendations", [])) == 0
+            and "taking longer" in (resp.get("reply") or "").lower()
+        )
+        if is_timeout_reply:
+            consecutive_empty_replies += 1
+            if consecutive_empty_replies >= 2:
+                if verbose:
+                    print(f"  ! stuck (two consecutive timeouts) — ending trace")
+                break
+        else:
+            consecutive_empty_replies = 0
 
         if verbose:
             n = len(resp.get("recommendations", []))
