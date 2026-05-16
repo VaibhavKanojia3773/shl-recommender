@@ -73,7 +73,7 @@ WHEN to set end_of_conversation=true:
 - Turn 8 always forces true.
 
 OUTPUT FORMAT — return ONLY a JSON object, no markdown fences, no preamble:
-{{"reply": "your conversational answer here", "recommendations": [{{"name": "exact name from catalog", "url": "exact URL from catalog", "test_type": "K"}}], "end_of_conversation": false}}
+{"reply": "your conversational answer here", "recommendations": [{"name": "exact name from catalog", "url": "exact URL from catalog", "test_type": "K"}], "end_of_conversation": false}
 
 test_type uses short codes from the catalog: A, B, C, D, E, K, P, S. Comma-separated if multiple (e.g. "K,S").
 
@@ -288,7 +288,7 @@ def validate_and_clean(parsed: dict) -> dict:
             continue
         seen.add(item["link"])
 
-        test_type = keys_to_codes(item.get("keys") or []) or "—"
+        test_type = keys_to_codes(item.get("keys") or [])
         clean.append({
             "name": item["name"],
             "url": item["link"],
@@ -351,9 +351,10 @@ def run_agent_turn(messages: list[dict]) -> dict:
     # Step 2: semantic retrieval
     retrieved = query_assessments(intent_query, n_results=20)
 
-    # Step 3: build prompt
+    # Step 3: build prompt. Use replace() rather than .format() so any literal
+    # `{` / `}` in catalog descriptions cannot raise a KeyError on format args.
     catalog_context = build_catalog_context(retrieved)
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(catalog_context=catalog_context)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.replace("{catalog_context}", catalog_context)
 
     if is_final_turn:
         system_prompt += (
@@ -364,9 +365,9 @@ def run_agent_turn(messages: list[dict]) -> dict:
     # Step 4: call main model
     try:
         raw = call_main_model(system_prompt, messages)
-    except Exception as exc:
+    except Exception:
         return {
-            "reply": f"I hit a temporary error reaching the model. Please try again. ({type(exc).__name__})",
+            "reply": "I hit a temporary error generating a response. Please try again.",
             "recommendations": [],
             "end_of_conversation": False,
         }
