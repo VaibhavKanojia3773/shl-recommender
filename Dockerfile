@@ -13,8 +13,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Install CPU-only torch FIRST from the PyTorch CPU index.
+# This avoids pulling ~2 GB of NVIDIA/CUDA libraries that we don't use on a
+# free CPU-only Render instance. Pin a version that has a manylinux CPU wheel.
+RUN pip install --upgrade pip && \
+    pip install --index-url https://download.pytorch.org/whl/cpu \
+        "torch==2.5.1+cpu"
+
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install -r requirements.txt
 
 # Bake the embedding model into the image so cold starts don't download it
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
