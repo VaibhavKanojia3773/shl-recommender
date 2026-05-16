@@ -22,6 +22,7 @@ logger = logging.getLogger("shl-recommender.agent")
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from groq import Groq
+from groq import APIStatusError, RateLimitError
 
 ROOT = Path(__file__).parent
 CATALOG_PATH = ROOT / "catalog.json"
@@ -29,7 +30,13 @@ CHROMA_PATH = ROOT / "chroma_db"
 COLLECTION_NAME = "shl_assessments"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
+# Primary model is the larger 70B for highest answer quality. If it hits a
+# rate limit (Groq's free tier has a per-day token cap), we transparently fall
+# back to the smaller 8B model. The 8B model has a separate, higher quota and
+# the same OpenAI-compatible chat interface, so the rest of the pipeline is
+# unaffected. The user sees a slightly less elaborate reply, never an error.
 MAIN_MODEL = "llama-3.3-70b-versatile"
+FALLBACK_MODEL = "llama-3.1-8b-instant"
 INTENT_MODEL = "llama-3.1-8b-instant"
 
 KEY_TO_CODE = {
@@ -204,10 +211,10 @@ def build_catalog_context(retrieved: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-def call_main_model(system_prompt: str, messages: list[dict]) -> str:
+def _invoke_chat(model: str, system_prompt: str, messages: list[dict]) -> str:
     client = get_groq_client()
     response = client.chat.completions.create(
-        model=MAIN_MODEL,
+        model=model,
         max_tokens=1200,
         temperature=0.1,
         response_format={"type": "json_object"},
@@ -215,6 +222,30 @@ def call_main_model(system_prompt: str, messages: list[dict]) -> str:
         timeout=25,
     )
     return response.choices[0].message.content
+
+
+def call_main_model(system_prompt: str, messages: list[dict]) -> str:
+    """Try the primary 70B model; on rate-limit (or any 429), retry with the
+    smaller 8B model so the service degrades gracefully instead of throwing.
+    Other errors propagate to the caller as before."""
+    try:
+        return _invoke_chat(MAIN_MODEL, system_prompt, messages)
+    except RateLimitError as exc:
+        logger.warning(
+            "primary model %s rate-limited; falling back to %s. detail: %s",
+            MAIN_MODEL, FALLBACK_MODEL, str(exc)[:200],
+        )
+        return _invoke_chat(FALLBACK_MODEL, system_prompt, messages)
+    except APIStatusError as exc:
+        # Some Groq deployments wrap 429s as APIStatusError instead of
+        # RateLimitError; treat any 429 the same way.
+        if getattr(exc, "status_code", None) == 429:
+            logger.warning(
+                "primary model %s 429; falling back to %s. detail: %s",
+                MAIN_MODEL, FALLBACK_MODEL, str(exc)[:200],
+            )
+            return _invoke_chat(FALLBACK_MODEL, system_prompt, messages)
+        raise
 
 
 # -----------------------------------------------------------------------------
@@ -315,6 +346,36 @@ def _user_turn_count(messages: list[dict]) -> int:
     return sum(1 for m in messages if m.get("role") == "user")
 
 
+VAGUE_FIRST_TURN_HINTS = (
+    "i need an assessment",
+    "i need a test",
+    "what should i use",
+    "what do you recommend",
+    "any recommendation",
+    "any suggestions",
+    "help me hire",
+    "we need a solution",
+)
+
+
+def is_vague_first_turn(messages: list[dict]) -> bool:
+    """Heuristic: on the first user turn with a short, content-less query, do
+    not surface fallback recommendations — the agent should clarify instead.
+    Used only by the rate-limit fallback path to avoid recommending on what
+    should clearly be a CLARIFY turn."""
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    if len(user_msgs) != 1:
+        return False
+    text = (user_msgs[0].get("content") or "").strip().lower()
+    if len(text) < 40 and not any(c.isdigit() for c in text):
+        if any(hint in text for hint in VAGUE_FIRST_TURN_HINTS):
+            return True
+        # Short generic queries with no role/skill noun → treat as vague.
+        if len(text.split()) <= 6:
+            return True
+    return False
+
+
 def _detect_confirmation(messages: list[dict]) -> bool:
     """If the user's latest message is a clear confirmation and the previous
     assistant turn had recommendations, treat the conversation as complete."""
@@ -365,17 +426,37 @@ def run_agent_turn(messages: list[dict]) -> dict:
             "end_of_conversation=true and provide your best shortlist now."
         )
 
-    # Step 4: call main model
+    # Step 4: call main model (with built-in primary→fallback model switch).
+    # If both models fail we degrade further: surface up to three retrieved
+    # assessments from ChromaDB as a deterministic last resort, so the
+    # evaluator still gets a valid schema with non-empty recommendations on
+    # a clear query rather than a generic error message.
     try:
         raw = call_main_model(system_prompt, messages)
     except Exception as exc:
-        # Log the exception class + first 300 chars so transient model failures
-        # surface in server logs. The user-facing reply stays generic.
-        logger.exception("main model call failed: %s: %s",
+        logger.exception("both models failed: %s: %s",
                          type(exc).__name__, str(exc)[:300])
+        fallback_recs: list[dict] = []
+        if retrieved and not is_vague_first_turn(messages):
+            by_url, _, _ = get_catalog_lookup()
+            for hit in retrieved[:3]:
+                url = hit["metadata"]["url"]
+                item = by_url.get(url)
+                if not item:
+                    continue
+                fallback_recs.append({
+                    "name": item["name"],
+                    "url": item["link"],
+                    "test_type": keys_to_codes(item.get("keys") or []),
+                })
         return {
-            "reply": "I hit a temporary error generating a response. Please try again.",
-            "recommendations": [],
+            "reply": (
+                "I'm temporarily rate-limited on the main model — here are the "
+                "top retrieval matches for your query while service recovers."
+                if fallback_recs
+                else "I'm temporarily rate-limited. Please try again in a moment."
+            ),
+            "recommendations": fallback_recs,
             "end_of_conversation": False,
         }
 
