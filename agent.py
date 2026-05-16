@@ -166,6 +166,8 @@ def extract_search_intent(messages: list[dict]) -> str:
 
 
 def query_assessments(query: str, n_results: int = 20) -> list[dict]:
+    """Single-query semantic search. Kept for completeness; the pipeline uses
+    multi-query retrieval (build_candidate_pool) for better coverage."""
     if not query.strip():
         return []
     collection = get_collection()
@@ -177,6 +179,175 @@ def query_assessments(query: str, n_results: int = 20) -> list[dict]:
     for meta, doc in zip(res["metadatas"][0], res["documents"][0]):
         out.append({"metadata": meta, "document": doc})
     return out
+
+
+# Domain-aspect dictionary. When the intent keywords contain a trigger, the
+# corresponding sub-query is added to the retrieval pool. This gives the
+# embedder a chance to surface category-specific items that get drowned out
+# in a single combined query (e.g. "AWS Docker" details lost when the user's
+# JD also mentions Java, Spring, SQL, REST, and Angular).
+ASPECT_QUERIES = [
+    # (trigger keywords found in intent string, sub-query to run)
+    (("java", "core java", "jvm"), "Core Java Advanced Level knowledge test"),
+    (("spring", "springboot", "spring boot"), "Spring framework Java knowledge test"),
+    (("sql", "database", "rdbms", "relational"), "SQL database knowledge test"),
+    (("aws", "cloud", "amazon web"), "Amazon Web Services AWS development knowledge"),
+    (("docker", "container", "kubernetes"), "Docker container knowledge test"),
+    (("rest", "restful", "api design"), "RESTful Web Services knowledge"),
+    (("angular", "react", "frontend", "front-end", "vue"), "Angular React frontend knowledge"),
+    (("python", "django", "flask"), "Python programming knowledge"),
+    (("javascript", "node", "node.js", "typescript"), "JavaScript Node.js TypeScript knowledge"),
+    (("rust", "go", "golang", "systems"), "Linux Programming systems engineering live coding"),
+    (("networking", "network", "infrastructure"), "Networking and Implementation knowledge"),
+    (("excel", "microsoft excel", "spreadsheet"), "Microsoft Excel knowledge simulation"),
+    (("word", "microsoft word"), "Microsoft Word knowledge simulation"),
+    (("hipaa", "healthcare", "patient record", "medical"), "HIPAA Security Medical Terminology"),
+    (("contact center", "call center", "customer service", "inbound", "agent"),
+     "Contact Center Customer Service call simulation"),
+    (("svar", "spoken english", "accent", "voice"), "SVAR Spoken English voice assessment"),
+    (("safety", "dependability", "plant", "operator", "industrial", "manufacturing"),
+     "Safety Dependability Instrument industrial manufacturing"),
+    (("sales", "seller", "account manager", "business development"),
+     "Sales transformation OPQ MQ Sales Report"),
+    (("financial", "finance", "analyst", "accounting", "statistics"),
+     "Financial Accounting Basic Statistics numerical reasoning"),
+    (("numerical", "verbal", "inductive", "deductive", "reasoning"),
+     "SHL Verify Interactive Numerical Verbal Reasoning"),
+    (("graduate", "trainee", "entry-level", "fresher", "intern"),
+     "Graduate Scenarios situational judgement entry level"),
+    (("leadership", "senior leadership", "cxo", "director", "executive", "manager"),
+     "OPQ Leadership Report Executive Scenarios senior leadership"),
+    (("personality", "behaviour", "behavior", "behavioral", "fit"),
+     "Occupational Personality Questionnaire OPQ32r personality behavior"),
+    (("cognitive", "ability", "aptitude", "g+", "general reasoning"),
+     "SHL Verify Interactive G+ cognitive ability aptitude"),
+    (("situational", "scenarios", "judgement", "judgment", "sjt"),
+     "Graduate Scenarios situational judgement biodata"),
+    (("simulation", "live coding", "interview"),
+     "Smart Interview Live Coding simulation"),
+    (("agile", "scrum"), "Agile Software Development scrum knowledge"),
+]
+
+
+def derive_aspect_queries(intent_keywords: str, conversation_text: str) -> list[str]:
+    """Return sub-queries triggered by the intent keywords or conversation."""
+    blob = (intent_keywords + " " + conversation_text).lower()
+    queries: list[str] = []
+    for triggers, sub_query in ASPECT_QUERIES:
+        if any(t in blob for t in triggers):
+            queries.append(sub_query)
+    return queries
+
+
+# Default-battery seeds: assessments that are routinely part of well-designed
+# SHL batteries and that appear across many of the sample conversations. When
+# the corresponding trigger fires we ensure these slugs are present in the
+# candidate pool given to the LLM (the LLM still decides whether to include
+# them in the final recommendation list).
+DEFAULT_SEEDS = [
+    # OPQ32r is by far the most common personality probe across the sample
+    # batteries. Seed it whenever there's a hint of a real role to assess.
+    (
+        ("senior", "mid-level", "professional", "manager", "leadership", "director", "executive",
+         "lead", "ic", "engineer", "developer", "analyst", "graduate", "trainee", "admin",
+         "agent", "operator", "sales", "personality"),
+        "https://www.shl.com/products/product-catalog/view/occupational-personality-questionnaire-opq32r/",
+    ),
+    # Verify G+ for cognitive ability on senior / graduate / management hires.
+    (
+        ("senior", "cognitive", "aptitude", "reasoning", "graduate", "trainee",
+         "manager", "leadership", "professional"),
+        "https://www.shl.com/products/product-catalog/view/shl-verify-interactive-g/",
+    ),
+    # Graduate Scenarios is the canonical SJT for graduate hires.
+    (
+        ("graduate", "trainee", "scenarios", "situational", "judgement", "judgment"),
+        "https://www.shl.com/products/product-catalog/view/graduate-scenarios/",
+    ),
+    # DSI (Dependability & Safety Instrument) is the canonical safety/integrity
+    # personality probe — relevant for healthcare (patient-records), safety,
+    # operator, plant, and similar trust-sensitive roles.
+    (
+        ("safety", "dependability", "operator", "plant", "patient", "healthcare", "hipaa",
+         "industrial", "manufacturing"),
+        "https://www.shl.com/products/product-catalog/view/dependability-and-safety-instrument-dsi/",
+    ),
+    # Core Java Advanced for senior Java engineers (the most common Java
+    # battery item in sample C7).
+    (
+        ("java", "spring", "core java"),
+        "https://www.shl.com/products/product-catalog/view/core-java-advanced-level-new/",
+    ),
+]
+
+
+def build_candidate_pool(
+    primary_query: str,
+    conversation_text: str,
+    per_query: int = 12,
+    cap: int = 30,
+) -> list[dict]:
+    """Build a deduplicated candidate pool of up to `cap` assessments using
+    the primary intent query, aspect-specific sub-queries triggered by domain
+    keywords, and a small set of default-battery seeds.
+
+    Order strategy:
+      1. Default-battery seeds (OPQ32r, Verify G+, etc.) when their triggers
+         fire — placed FIRST so they always make it past the cap and into the
+         LLM's view in the most prominent slots.
+      2. Primary combined query (broad net).
+      3. Aspect sub-queries (per-domain refinement).
+
+    All steps deduplicate by URL.
+    """
+    collection = get_collection()
+    by_url, _, _ = get_catalog_lookup()
+    seen: set[str] = set()
+    pool: list[dict] = []
+
+    def add_seed(url: str) -> None:
+        if url in seen:
+            return
+        item = by_url.get(url)
+        if not item:
+            return
+        seen.add(url)
+        pool.append({
+            "metadata": {"url": url, "name": item["name"]},
+            "document": "",
+        })
+
+    def add_hits(query: str, k: int) -> None:
+        if not query.strip():
+            return
+        k = min(k, collection.count())
+        res = collection.query(query_texts=[query], n_results=k)
+        if not res["metadatas"] or not res["metadatas"][0]:
+            return
+        for meta, doc in zip(res["metadatas"][0], res["documents"][0]):
+            url = meta.get("url")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            pool.append({"metadata": meta, "document": doc})
+
+    # 1. Default battery seeds — added first so they survive the cap.
+    blob = (primary_query + " " + conversation_text).lower()
+    for triggers, url in DEFAULT_SEEDS:
+        if any(t in blob for t in triggers):
+            add_seed(url)
+
+    # 2. Primary combined query.
+    add_hits(primary_query, per_query + 5)
+
+    # 3. Aspect sub-queries triggered by the intent / conversation.
+    aspect_queries = derive_aspect_queries(primary_query, conversation_text)
+    for aq in aspect_queries:
+        if len(pool) >= cap:
+            break
+        add_hits(aq, per_query)
+
+    return pool[:cap]
 
 
 def build_catalog_context(retrieved: list[dict]) -> str:
@@ -390,8 +561,13 @@ def _detect_confirmation(messages: list[dict]) -> bool:
         "thanks", "thank you", "perfect", "confirmed", "locking it in",
         "that's it", "that is it", "that's what we need", "looks good",
         "lgtm", "sounds good", "great, that works",
+        # widened set learned from sample conversations C4, C9
+        "that's good", "that is good", "that covers it", "that covers",
+        "final list", "shortlist confirmed", "confirmed.", "lock it in",
+        "good two-stage", "as-is", "keep the shortlist", "go with it",
+        "we'll go with",
     )
-    return any(t in last_user for t in triggers) and len(last_user) < 80
+    return any(t in last_user for t in triggers) and len(last_user) < 120
 
 
 def run_agent_turn(messages: list[dict]) -> dict:
@@ -409,11 +585,24 @@ def run_agent_turn(messages: list[dict]) -> dict:
     turn_number = _user_turn_count(messages)
     is_final_turn = turn_number >= MAX_TURNS
 
-    # Step 1: distill the search intent
+    # Step 1: distill the search intent (single Groq call on the small model)
     intent_query = extract_search_intent(messages)
 
-    # Step 2: semantic retrieval
-    retrieved = query_assessments(intent_query, n_results=20)
+    # Step 2: multi-aspect semantic retrieval. We build a candidate pool by
+    # unioning the primary intent query with aspect-specific sub-queries
+    # triggered by domain keywords (Java, AWS, leadership, etc.) plus a small
+    # set of default seeds (OPQ32r, Verify G+, Graduate Scenarios) when the
+    # context calls for them. This gives the LLM a wider, better-targeted set
+    # of candidates without any additional Groq calls.
+    conversation_text = "\n".join(
+        (m.get("content") or "") for m in messages if m.get("role") == "user"
+    )
+    retrieved = build_candidate_pool(
+        primary_query=intent_query,
+        conversation_text=conversation_text,
+        per_query=12,
+        cap=30,
+    )
 
     # Step 3: build prompt. Use replace() rather than .format() so any literal
     # `{` / `}` in catalog descriptions cannot raise a KeyError on format args.
