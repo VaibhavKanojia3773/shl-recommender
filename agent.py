@@ -11,10 +11,13 @@ Pipeline per turn:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from functools import lru_cache
 from pathlib import Path
+
+logger = logging.getLogger("shl-recommender.agent")
 
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
@@ -365,7 +368,11 @@ def run_agent_turn(messages: list[dict]) -> dict:
     # Step 4: call main model
     try:
         raw = call_main_model(system_prompt, messages)
-    except Exception:
+    except Exception as exc:
+        # Log the exception class + first 300 chars so transient model failures
+        # surface in server logs. The user-facing reply stays generic.
+        logger.exception("main model call failed: %s: %s",
+                         type(exc).__name__, str(exc)[:300])
         return {
             "reply": "I hit a temporary error generating a response. Please try again.",
             "recommendations": [],
