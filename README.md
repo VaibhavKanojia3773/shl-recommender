@@ -2,6 +2,9 @@
 
 A FastAPI service that recommends SHL Individual Test Solutions through multi-turn dialogue.
 
+**Live endpoint:** https://shl-recommender-2dxd.onrender.com
+**Interactive docs:** https://shl-recommender-2dxd.onrender.com/docs
+
 ## Endpoints
 
 - `GET /health` → `{"status": "ok", "catalog_size": N}`
