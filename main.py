@@ -70,11 +70,8 @@ async def lifespan(_: FastAPI):
     except Exception as exc:
         logger.error("failed to open ChromaDB collection: %s", exc)
 
-    if not os.environ.get("GEMINI_API_KEY"):
-        logger.warning("GEMINI_API_KEY is not set — main model calls will fail")
     if not os.environ.get("GROQ_API_KEY"):
-        logger.warning("GROQ_API_KEY is not set — intent extraction will fall back "
-                       "to last-user-message heuristic")
+        logger.warning("GROQ_API_KEY is not set — /chat will return errors")
 
     yield
     logger.info("shutting down")

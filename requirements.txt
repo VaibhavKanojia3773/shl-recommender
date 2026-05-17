@@ -1,12 +1,6 @@
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
-# Groq for the fast small-model intent extractor (sub-second, 8B model).
 groq==0.13.0
-# Gemini for the main grounded-generation call. Higher daily quota than
-# Groq's free tier, and a longer effective context window for the 22-item
-# candidate pool. Uses the new `google.genai` SDK (the old
-# `google.generativeai` package is EOL).
-google-genai>=0.7.0,<2.0.0
 chromadb>=1.0.0,<2.0.0
 sentence-transformers==3.3.1
 # torch is pre-installed in the Dockerfile from the CPU-only index.
