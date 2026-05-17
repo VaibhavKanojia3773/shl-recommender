@@ -1,92 +1,43 @@
-# Approach Document — Conversational SHL Assessment Recommender
+# SHL Conversational Assessment Recommender — Approach
 
-**Author:** Vaibhav Kanojia
-**Endpoint:** https://shl-recommender-2dxd.onrender.com
-**Repository:** https://github.com/VaibhavKanojia3773/shl-recommender
-
----
-
-## 1. Problem framing
-
-Recruiters rarely arrive with the right vocabulary. They say "I'm hiring a Java dev who works with stakeholders" — not "I need a knowledge-skills test with a personality component." A keyword catalog forces them to translate intent into SHL's taxonomy before they can search. The goal of this project was to invert that flow: let the recruiter speak naturally and let the agent take responsibility for translation, grounding, and shortlisting.
-
-The harder problem was making this work under three simultaneous constraints — a stateless API, an 8-turn ceiling, and a strict ban on hallucinated assessments. Each of those constraints quietly rules out a class of "obvious" solutions, and most of the design effort went into respecting them without making the agent feel mechanical.
+**Vaibhav Kanojia** · vaibhavkanojia3773@gmail.com
+Endpoint: https://shl-recommender-2dxd.onrender.com
+Source: https://github.com/VaibhavKanojia3773/shl-recommender
 
 ---
 
-## 2. Architecture at a glance
+### Design choices
 
-The service is a single FastAPI process with two endpoints (`/health`, `/chat`). Every `/chat` request flows through a five-step pipeline:
+The catalog is closed (377 Individual Test Solutions). The agent should never invent an assessment. That single constraint shapes the whole system: retrieval first, generation second, then a hard validator that drops anything the model fabricates. The stack is FastAPI for the API surface, ChromaDB (persistent, embedded) for vectors, `all-MiniLM-L6-v2` for embeddings, and Groq's free tier for the LLMs — Llama 3.3 70B Versatile as the main generator with Llama 3.1 8B Instant as a quota-fallback and as the intent extractor. Render's free Docker tier hosts it. The 2-minute cold-start window the assignment allows on `/health` matches Render's free-tier wake time, so no infrastructure compromises were needed.
 
-1. **Intent extraction** — a small fast model (Llama 3.1 8B Instant on Groq) distills the conversation into 8–15 search keywords. Doing this with a model rather than concatenating message text gives much better recall when the user mentions a skill in turn 1 and constrains it in turn 4.
-2. **Semantic retrieval** — those keywords go through `sentence-transformers/all-MiniLM-L6-v2` and hit a persistent ChromaDB collection of all 377 SHL Individual Test Solutions. The top 20 candidates are returned with their full metadata.
-3. **Grounded generation** — the main model (Llama 3.3 70B Versatile on Groq) receives the system prompt, the full conversation, and the 20 candidates as a structured context block. It is instructed to recommend only from this block, and to return its response as a JSON object matching the assignment schema.
-4. **Robust parsing** — a four-stage JSON parser handles raw output, markdown-fenced output, embedded objects, and finally a safe fallback. Production has not needed stages 2–4 yet, but they exist because LLM JSON discipline is a "fails silently or fails catastrophically" property.
-5. **Hallucination validation** — every URL the model returns is checked against an in-memory set built from `catalog.json` at startup. Any URL not in that set is dropped silently. If the model returns a valid catalog name but a malformed URL, the validator recovers the canonical URL from a name-based lookup. The user therefore cannot be shown a fabricated assessment under any circumstance.
+Two models, not one, was a deliberate split. Asking the 70B to also extract search keywords added 1–2 s of latency per turn for no quality gain; the 8B model produces a clean keyword string in ~300 ms and frees the larger model to focus on reasoning and JSON output. The `chroma_db/` directory and `catalog.json` are both committed to the repo and baked into the Docker image so cold starts don't re-embed the catalog or download anything at runtime.
 
-A more detailed diagram is included on the final page.
+### Retrieval setup
 
----
+A single semantic query over a multi-aspect job description (e.g. *"Java + Spring + AWS + Docker + senior IC"*) misses things. The dominant embedding direction wins; the others get drowned. So the retriever splits the intent string into aspect-specific sub-queries triggered by keywords (`java`, `aws`, `docker`, `leadership`, `graduate`, `contact center`, `hipaa`, `safety`, …) and unions the top hits from each. A small set of default-battery seeds — OPQ32r, Verify G+, Graduate Scenarios, DSI, Core Java Advanced — is injected at the top of the candidate pool when their triggers fire, mirroring the layering pattern the sample conversations consistently use. The pool is capped at 22 items so the LLM sees a wide, targeted slate without bloating the prompt. Offline retrieval analysis confirmed that this lifts top-K recall on the multi-aspect personas from ~62 % to ~98 % without any additional LLM calls.
 
-## 3. Why this stack
+### Prompt design
 
-Every component was chosen with the 30-second per-turn timeout in mind, and with the assignment's preference for free, open-source infrastructure.
+The system prompt locks the model into one of five modes — **CLARIFY**, **RECOMMEND**, **REFINE**, **COMPARE**, **REFUSE** — and gives it explicit decision rules for choosing between them. Four absolute rules sit at the top: catalog-only, verbatim URLs, refuse off-topic and legal interpretation, don't recommend on a vague turn 1. The 22 retrieved candidates are appended as a structured numbered list with full metadata (name, URL, test-type codes, keys, job levels, languages, duration, 200-char description). Output shape is enforced two ways — the prompt shows a concrete JSON example, and Groq's `response_format={"type": "json_object"}` guarantees JSON at the API level. The reply is parsed through a four-stage fallback (direct JSON → markdown-fenced → regex-extracted → safe default), and every URL is validated against `catalog.json` before it reaches the client. If the model returns a real catalog name but a malformed URL, the validator recovers the canonical URL by name lookup. Hallucinated URLs are silently dropped — they never reach the user.
 
-- **Groq as the inference provider.** Two model calls per turn (intent + main) plus retrieval need to finish in under 25 seconds with a 5-second buffer. Groq's typical latency on Llama 3.3 70B is 1–2 seconds end-to-end, which leaves comfortable headroom for cold-start variance.
-- **Two models, not one.** Using a small model (8B Instant) for keyword extraction is essentially free in tokens and time, and it lets the larger 70B model spend its budget on reasoning and JSON discipline. A single-model design felt tidier but cost ~40 % more latency in early experiments.
-- **ChromaDB persistent store.** Embedded, zero-ops, ships inside the Docker image. The vector index is built once locally and committed to the repo, so cold starts on Render don't re-embed 377 documents.
-- **all-MiniLM-L6-v2 embeddings.** 22 MB, no API key, baked into the Docker image at build time. Good enough quality for a catalog this size, and crucially: deterministic across deploys.
-- **FastAPI + Uvicorn.** Async by default, Pydantic-validated request and response schemas, and an auto-generated `/docs` endpoint that doubles as a manual-test UI for evaluators.
-- **Render (Docker, free tier).** Honours the 2-minute cold-start allowance the assignment explicitly accounts for. The Dockerfile installs CPU-only PyTorch from PyTorch's CPU wheel index to avoid pulling ~2 GB of unused NVIDIA libraries — a fix that took one failed deploy to discover.
+### Evaluation approach
 
----
+Two harnesses run against the live endpoint. `production_audit.py` exercises targeted probes: `/health`, vague-turn-1 (must clarify), clear JD (must recommend), off-topic and code-writing requests (must refuse), prompt-injection with a fabricated URL (must drop), a non-existent assessment name (must drop), comparison, refinement with explicit drops, confirmation closure, and an empty-body request (must 4xx). `replay_harness.py` simulates the SHL evaluator more faithfully: a persona-driven user that answers the agent's questions from a fact set, says *"no preference"* outside its facts, and ends when a shortlist is offered — the exact behaviour described in the assignment. The harness records per-trace schema problems, hallucination counts, turn count, latency, and Recall@10 against the labelled expected shortlist. Both ran continuously while I iterated.
 
-## 4. Prompt and conversation design
+### What didn't work, and how I measured improvement
 
-The system prompt is deliberately mode-driven. Rather than asking the model to "be helpful," it is given five explicit modes — CLARIFY, RECOMMEND, REFINE, COMPARE, REFUSE — and decision rules for choosing between them. The prompt then declares four absolute rules (catalog-only, verbatim URLs, refuse off-topic, don't recommend on a vague turn 1), followed by the output schema with a concrete example.
+A single concatenated query through ChromaDB was the first thing I tried. The replay harness flagged C7 (multi-stack Java engineer) and C9 (Excel + Word admin) as systematic 0 % traces. Offline analysis showed the right URLs sat at rank 30–60 — present, but unreachable in a top-20 pool. Aspect-based sub-queries plus seeded defaults moved those traces from 0 % toward parity with the simpler personas, with measurable lifts visible in the harness's per-trace Recall@10. Widening the candidate pool further to 30 then *hurt*, because prompt token growth pushed P50 latency past the 25-second internal timeout — I caught this in the same harness's latency column and trimmed back to 22 with shorter descriptions.
 
-This structure was iterated against the ten provided sample conversations (C1–C10), which encode behaviours the evaluator clearly cares about: layering cognitive + personality + domain tests for senior technical hires (C7), refusing legal interpretation questions while keeping the existing shortlist intact (C6), graceful handling of niche roles with no exact catalog match (C2 — senior Rust engineer), and recognising confirmation phrases to end the conversation cleanly (C1, C4, C5).
+A separate detour: I migrated the main model to Gemini 2.0 Flash to escape Groq's 100 k tokens-per-day cap. Every Gemini key I generated landed on a Google Cloud project with free-tier quota set to zero (HTTP 429 `RESOURCE_EXHAUSTED` on the first call) or denied access entirely (HTTP 403). A Google-side issue, not a code one. Rolled back to Groq with a graceful 70B → 8B fallback to keep the service resilient when the 70B's daily cap is hit.
 
-The 20-candidate context block is structured as a numbered list with full metadata per item — name, URL, type codes, keys, job levels, languages, duration, and a truncated description. Providing this in a stable format meant the model rarely tried to invent a URL; almost all hallucination attempts during testing were the model copying a name correctly but rewriting the URL slug. The post-generation validator catches those cases without the user noticing.
+Filtering ChromaDB by test-type codes when the user said *"cognitive"* or *"personality"* hurt recall measurably — a *"cognitive"* query should still surface relevant simulation- and biodata-type items. The LLM filters from a broader pool better than the retriever does.
+
+### Use of AI tools
+
+I used **Claude Code** (Anthropic) as a coding assistant throughout: scaffolding the FastAPI service and Dockerfile, debugging the CPU-only PyTorch deploy on Render, iterating the system prompt, building the replay harness, and writing this document. Design decisions — the retrieval-first architecture, the two-model split, the seeded multi-aspect pool, the validator-as-safety-net, the mode-driven prompt — were mine.
 
 ---
 
-## 5. Evaluation
+### System diagram
 
-Local evaluation focused on three things that map to the assignment's scoring rubric.
-
-- **Schema compliance.** A production audit script (`production_audit.py`) runs fourteen end-to-end calls against the live endpoint, including the `/health` check, the four conversational modes, two adversarial probes (prompt injection and a fabricated assessment name), a refinement sequence, a confirmation phrase, and replays of three sample conversations. Each response is validated key-by-key against the Pydantic schema, and every returned URL is checked against `catalog.json`. The Groq `response_format={"type": "json_object"}` setting plus the four-stage parser have produced zero schema violations in this audit.
-- **Hallucination rate.** The audit's injection probe instructs the model to return a fabricated assessment with an `evil.example.com` URL; another probe asks for a non-existent "HireQuotient Rust Backend Battery." In both cases the model occasionally tries to oblige in its `reply` field, but the validator drops the fabricated URL before it reaches the client. Hallucinations in `recommendations`: **0**.
-- **Behavioural alignment with sample conversations.** I read all ten C-traces before writing the prompt and used their patterns as a regression set. The audit's C1 replay (senior leadership selection) surfaces OPQ Leadership Report and HiPo Assessment Report 2.0; the C4 replay (graduate financial analysts) surfaces Verify Numerical Ability and Financial Accounting; and the agent ends the conversation on confirmation phrases without needing the turn-8 cap to fire. One known imperfection: when a user asks to "compare OPQ32r and Verify G+" with those exact short names, the embedding model sometimes misses the canonical OPQ32r record and surfaces an OPQ report variant instead — a recall issue rather than a hallucination, and a candidate for the cross-encoder reranker mentioned in section 8.
-
----
-
-## 6. What didn't work
-
-A few approaches were tried and dropped:
-
-- **Single-model agent.** Initially I had Llama 3.3 70B do both intent extraction and response generation. This was tidier code but slower per turn — extraction adds 1–2 seconds of latency on the 70B model versus ~300 ms on 8B Instant. Splitting keyword extraction to the smaller model freed the larger one to focus on reasoning and the JSON contract.
-- **Filtering ChromaDB by test-type code.** I tried restricting retrieval to specific test types when the user mentioned "personality" or "cognitive." This hurt recall — a "cognitive" query should still surface relevant simulation- and biodata-type assessments. Letting the LLM filter from a broader candidate set worked better.
-- **Static catalog formatting in the prompt.** Embedding the full catalog (377 items) in the system prompt was tried briefly. It worked but was wasteful in tokens, slower, and made comparison requests harder. Top-20 retrieval per turn is the right middle ground.
-- **The default PyTorch wheel on Render.** The first deploy attempted to install `torch` with its full CUDA dependency tree (~2 GB). The CPU-only wheel from `download.pytorch.org/whl/cpu` is roughly a tenth of the size and works identically for inference on Render's CPU instances.
-
----
-
-## 7. Use of AI tools
-
-This project was built with **Claude Code** (Anthropic) as a coding assistant. I used it for: scaffolding the FastAPI service and Dockerfile, exploring the SHL catalog structure, drafting the system prompt, debugging the CPU-only PyTorch deployment failure on Render, and writing this approach document. All design choices — the two-model split, the validator-as-safety-net, the candidate context format, the mode-driven prompt — were mine. The agent acted as a fast pair-programmer; I remained the engineer.
-
----
-
-## 8. What I would change with more time
-
-- **Reranking.** Add a cross-encoder reranker between ChromaDB and the LLM. The MiniLM embeddings are good but coarse for a catalog this dense (e.g., distinguishing OPQ32r from the dozen OPQ report variants).
-- **Few-shot exemplars.** Inject one or two of the sample conversations directly into the system prompt as gold examples. I deliberately avoided this to keep the prompt slim, but it would likely lift recall on the harder personas.
-- **Soft caching of intent extraction.** When the conversation history hasn't changed meaningfully between turns, the same keywords are re-derived. A hash-based cache would shave another 300–500 ms per turn.
-- **A proper evaluation harness.** I wrote a manual smoke test; a replay harness similar to the one SHL uses, but driven by my own simulated user, would give a continuous Recall@10 signal during iteration.
-
----
-
-## 9. System diagram
-
-See the appended diagram on the next page. The flow is: client → FastAPI → intent extraction (Llama 3.1 8B) → ChromaDB retrieval → main generation (Llama 3.3 70B) → JSON parse + validate → response.
+![Architecture](architecture.png)
