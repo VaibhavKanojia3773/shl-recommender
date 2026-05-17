@@ -20,9 +20,10 @@ from pathlib import Path
 logger = logging.getLogger("shl-recommender.agent")
 
 import chromadb
+from google import genai as google_genai
+from google.genai import types as genai_types
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from groq import Groq
-from groq import APIStatusError, RateLimitError
 
 ROOT = Path(__file__).parent
 CATALOG_PATH = ROOT / "catalog.json"
@@ -30,13 +31,18 @@ CHROMA_PATH = ROOT / "chroma_db"
 COLLECTION_NAME = "shl_assessments"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-# Primary model is the larger 70B for highest answer quality. If it hits a
-# rate limit (Groq's free tier has a per-day token cap), we transparently fall
-# back to the smaller 8B model. The 8B model has a separate, higher quota and
-# the same OpenAI-compatible chat interface, so the rest of the pipeline is
-# unaffected. The user sees a slightly less elaborate reply, never an error.
-MAIN_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODEL = "llama-3.1-8b-instant"
+# Main grounded-generation model: Google Gemini 2.0 Flash.
+# - Much higher free-tier daily budget (1,500 RPD, effectively unlimited
+#   tokens-per-day on the free tier) than Groq's 100k TPD on the 70B model.
+# - JSON-mode (response_mime_type="application/json") gives the same hard
+#   schema guarantee Groq's response_format does.
+# - Sub-3-second latency for the prompt sizes this agent produces.
+#
+# Intent extraction stays on Groq's llama-3.1-8b-instant — it's the fastest
+# sub-second keyword extractor available on a free tier and uses negligible
+# tokens, so it isn't worth migrating.
+GEMINI_MAIN_MODEL = "gemini-2.0-flash"
+GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
 INTENT_MODEL = "llama-3.1-8b-instant"
 
 KEY_TO_CODE = {
@@ -108,6 +114,15 @@ def get_groq_client() -> Groq:
     if not api_key:
         raise RuntimeError("GROQ_API_KEY environment variable is not set")
     return Groq(api_key=api_key)
+
+
+@lru_cache(maxsize=1)
+def get_gemini_client() -> "google_genai.Client":
+    """Construct the google-genai client. Idempotent and cached."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is not set")
+    return google_genai.Client(api_key=api_key)
 
 
 @lru_cache(maxsize=1)
@@ -382,40 +397,72 @@ def build_catalog_context(retrieved: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-def _invoke_chat(model: str, system_prompt: str, messages: list[dict]) -> str:
-    client = get_groq_client()
-    response = client.chat.completions.create(
-        model=model,
-        max_tokens=1200,
+def _messages_to_gemini_contents(messages: list[dict]) -> list[genai_types.Content]:
+    """Translate the OpenAI-style message list into Gemini's `contents`.
+
+    - Gemini does not have a separate "system" role; we pass the system prompt
+      separately via system_instruction. Any incoming 'system' message is
+      treated as a user turn for safety.
+    - Gemini uses role 'user' / 'model' (not 'assistant').
+    """
+    out: list[genai_types.Content] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content") or ""
+        if role == "assistant":
+            gemini_role = "model"
+        else:  # user / system / anything else -> user
+            gemini_role = "user"
+        out.append(genai_types.Content(
+            role=gemini_role,
+            parts=[genai_types.Part(text=content)],
+        ))
+    return out
+
+
+def _invoke_chat(model_name: str, system_prompt: str, messages: list[dict]) -> str:
+    """Single Gemini generation. Returns the raw JSON-shaped text the model
+    produced (response_mime_type=application/json enforces JSON output)."""
+    client = get_gemini_client()
+    config = genai_types.GenerateContentConfig(
+        system_instruction=system_prompt,
         temperature=0.1,
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": system_prompt}] + messages,
-        timeout=25,
+        max_output_tokens=1200,
+        response_mime_type="application/json",
     )
-    return response.choices[0].message.content
+    contents = _messages_to_gemini_contents(messages)
+    response = client.models.generate_content(
+        model=model_name,
+        contents=contents,
+        config=config,
+    )
+    # `.text` is a convenience property that joins all text parts of the
+    # first candidate. Fall back to manual extraction if missing.
+    text = getattr(response, "text", None)
+    if text:
+        return text
+    if response.candidates:
+        parts = response.candidates[0].content.parts or []
+        return "".join(getattr(p, "text", "") or "" for p in parts)
+    return ""
 
 
 def call_main_model(system_prompt: str, messages: list[dict]) -> str:
-    """Try the primary 70B model; on rate-limit (or any 429), retry with the
-    smaller 8B model so the service degrades gracefully instead of throwing.
-    Other errors propagate to the caller as before."""
+    """Try the primary Gemini model; on quota/availability errors transparently
+    retry with the alternate Gemini model. Other errors propagate as before."""
     try:
-        return _invoke_chat(MAIN_MODEL, system_prompt, messages)
-    except RateLimitError as exc:
-        logger.warning(
-            "primary model %s rate-limited; falling back to %s. detail: %s",
-            MAIN_MODEL, FALLBACK_MODEL, str(exc)[:200],
-        )
-        return _invoke_chat(FALLBACK_MODEL, system_prompt, messages)
-    except APIStatusError as exc:
-        # Some Groq deployments wrap 429s as APIStatusError instead of
-        # RateLimitError; treat any 429 the same way.
-        if getattr(exc, "status_code", None) == 429:
+        return _invoke_chat(GEMINI_MAIN_MODEL, system_prompt, messages)
+    except Exception as exc:
+        # google.api_core.exceptions.ResourceExhausted (429) and
+        # ServiceUnavailable (503) are the two we want to fall back on.
+        cls = type(exc).__name__
+        if cls in ("ResourceExhausted", "ServiceUnavailable", "DeadlineExceeded",
+                   "InternalServerError"):
             logger.warning(
-                "primary model %s 429; falling back to %s. detail: %s",
-                MAIN_MODEL, FALLBACK_MODEL, str(exc)[:200],
+                "primary model %s failed with %s; falling back to %s",
+                GEMINI_MAIN_MODEL, cls, GEMINI_FALLBACK_MODEL,
             )
-            return _invoke_chat(FALLBACK_MODEL, system_prompt, messages)
+            return _invoke_chat(GEMINI_FALLBACK_MODEL, system_prompt, messages)
         raise
 
 
